@@ -92,6 +92,7 @@ fun SideMenu(
     val born = remember { android.os.SystemClock.uptimeMillis() }
     val current = remember { FocusRequester() }
     val search = remember { FocusRequester() }
+    val searchEdit = remember { FocusRequester() }
     val firstSection = remember { FocusRequester() }
     val top = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
@@ -114,7 +115,10 @@ fun SideMenu(
             open = false; switcher = false; editing = false
         }
     }
-    LaunchedEffect(editing) { if (editing) search.focusSoon() }
+    // Focus alone does not raise the Fire TV keyboard: ask for it, or OK had to be pressed twice.
+    // The text field has its own requester: sharing the button's, the request landed on the button just before it
+    // was replaced, the focus fell onto the first category and the keyboard never opened.
+    LaunchedEffect(editing) { if (editing && searchEdit.focusSoon()) keyboard?.show() }
 
     Box(modifier.width(63.dp).fillMaxHeight().zIndex(1f)) {
         // Folded strip: a single focus target, so Left from anywhere in the content lands here and opens the menu.
@@ -125,7 +129,12 @@ fun SideMenu(
                 // of the screen. It stays focusable and hands the focus on instead.
                 // A screen that has just appeared hands its first focus to the first focusable, which is this
                 // strip: that is not the household asking for the menu, so it does not open then.
-                .onFocusChanged { handleFocused = it.isFocused; if (it.isFocused && android.os.SystemClock.uptimeMillis() - born > 800) { open = true; entry++ } }
+                .onFocusChanged {
+                    handleFocused = it.isFocused
+                    // While the search field takes over from its button the focus passes through here: that is not
+                    // the household reopening the menu (it would put the focus back on the current category).
+                    if (it.isFocused && !editing && android.os.SystemClock.uptimeMillis() - born > 800) { open = true; entry++ }
+                }
                 .focusable()
                 .padding(vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -178,7 +187,7 @@ fun SideMenu(
                 Spacer(Modifier.height(4.dp))
                 // The keyboard only opens on OK, never just because the focus passes by.
                 if (editing) OutlinedTextField(
-                    query, onQuery, Modifier.fillMaxWidth().focusRequester(search),
+                    query, onQuery, Modifier.fillMaxWidth().focusRequester(searchEdit),
                     singleLine = true,
                     placeholder = { Text(searchHint, fontFamily = Hopla.Body, fontSize = 12.sp) },
                     textStyle = TextStyle(fontFamily = Hopla.Body, fontSize = 13.sp, color = Hopla.Text),

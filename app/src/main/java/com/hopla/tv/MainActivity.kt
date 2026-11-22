@@ -49,6 +49,8 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import android.widget.Toast
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -98,6 +100,7 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
     // With a saved link the first frame is the loading screen, never the playlist form (reading the cache of a
     // big list takes seconds on a small Fire TV, and the form used to show during that time).
     var loading by remember { mutableStateOf(link.isNotBlank()) }
+    var progress by remember { mutableStateOf<Pair<Float, String>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var settings by remember { mutableStateOf(false) }
     var section by remember { mutableStateOf(Section.HOME) }
@@ -129,32 +132,37 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
         // Kept as soon as it is typed: a big list takes a while to load, and an app stopped before the end
         // (Home pressed, low memory on a small Fire TV) used to ask for the link again at the next start.
         if (userAction) prefs.saveLink(l)
-        if (refresh) Toast.makeText(context, "Mise à jour de la playlist…", Toast.LENGTH_SHORT).show()
+        // ATLAS-style: the copy on the TV for the day, a full reload (with progress) once a day or on request.
+        // No background refresh any more: with 240 000 titles, two catalogues at once filled the memory.
         loadJob = scope.launch {
-            if (!userAction && !refresh && src.hasCache) {
-                val t0 = System.currentTimeMillis()
-                runCatching { withContext(Dispatchers.IO) { src.catalog(fresh = false) } }.getOrNull()?.let {
-                    catalog = it
-                    android.util.Log.i("Hopla", "cached catalogue: ${it.live.size} live, ${it.movies.size} films, ${it.shows.size} series in ${System.currentTimeMillis() - t0} ms")
-                }
-            }
-            if (catalog == null) loading = true
             try {
-                val fresh = withContext(Dispatchers.IO) { src.catalog(fresh = true) }
+                if (!userAction && !refresh && src.hasCache && src.cacheAge < 24 * 3_600_000L) {
+                    val t0 = System.currentTimeMillis()
+                    val cached = withContext(Dispatchers.IO) { src.catalog(fresh = false) }
+                    android.util.Log.i("Hopla", "cached catalogue: ${cached.live.size} live, ${cached.movies.size} films, ${cached.shows.size} series in ${System.currentTimeMillis() - t0} ms")
+                    catalog = cached
+                    loading = false
+                    return@launch
+                }
+                catalog = null // the old copy goes before the new one is read, never both in memory
+                loading = true
+                progress = 0f to "Connexion au serveur…"
+                val fresh = withContext(Dispatchers.IO) { src.catalog(fresh = true) { p, m -> progress = p to m } }
                 if (fresh.live.isEmpty()) error("Cette playlist ne contient aucune chaîne.")
                 prefs.saveLink(l)
                 history.bindTo(l, src.xtream)
                 src.dropOtherCaches() // only now that this link has proven to work
-                // Comparing two big catalogues is real work: do it off the main thread.
-                val old = catalog
-                if (withContext(Dispatchers.Default) { fresh != old }) catalog = fresh
+                catalog = fresh
                 settings = false
                 if (refresh) Toast.makeText(context, "Playlist à jour : ${fresh.live.size} chaînes, ${fresh.movies.size} films, ${fresh.shows.size} séries", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e // replaced by a newer load: not an error to show
-                // With a cached catalogue the household keeps watching; the error only matters on first setup.
-                if (catalog == null || userAction) error = friendlyError(e)
-                else if (refresh) Toast.makeText(context, "Mise à jour impossible : ${e.message ?: e.javaClass.simpleName}. La liste actuelle est gardée.", Toast.LENGTH_LONG).show()
+                // A failed daily reload keeps the household watching on the copy it has.
+                val cached = if (userAction || !src.hasCache) null else runCatching { withContext(Dispatchers.IO) { src.catalog(fresh = false) } }.getOrNull()
+                if (cached != null) {
+                    catalog = cached
+                    Toast.makeText(context, "Mise à jour impossible : ${e.message ?: e.javaClass.simpleName}. La liste actuelle est gardée.", Toast.LENGTH_LONG).show()
+                } else error = friendlyError(e)
             }
             loading = false
         }
@@ -173,7 +181,7 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
         // From the settings, Back returns to the channels instead of quitting the app.
         BackHandler(enabled = settings && cat != null) { settings = false }
         Box(Modifier.fillMaxSize().background(Hopla.Ground)) {
-            if (loading) Loading() else SetupScreen(link, { link = it }, error, previewSound, { previewSound = it; prefs.edit().putString("previewSound", it.name).apply() }) { catalog = null; load(userAction = true) }
+            if (loading) Loading(progress) else SetupScreen(link, { link = it }, error, previewSound, { previewSound = it; prefs.edit().putString("previewSound", it.name).apply() }) { catalog = null; load(userAction = true) }
         }
         return
     }
@@ -210,6 +218,35 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
     }
 
     val saved = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
+    // Films and series tiles are built once per catalogue, in the background: rebuilding 10 000 of them (names
+    // normalised for sorting, reading progress) on every visit made switching sections slow. Only the reading
+    // progress is refreshed, when the player closes.
+    val moviesById = remember(cat) { cat.movies.associateBy { it.id } }
+    val showsById = remember(cat) { cat.shows.associateBy { it.id } }
+    val movieBase by produceState<List<Pair<Tile, String>>?>(null, cat) {
+        val t0 = System.currentTimeMillis()
+        value = withContext(Dispatchers.Default) { cat.movies.map { Tile("m:${it.id}", it.name, it.group, it.poster, it.added, it.rating.toDoubleOrNull() ?: 0.0, it.year) to it.url } }
+        android.util.Log.i("Hopla", "film tiles: ${cat.movies.size} in ${System.currentTimeMillis() - t0} ms")
+    }
+    val movieTiles by produceState<List<Tile>?>(null, movieBase, playing == null) {
+        val base = movieBase ?: return@produceState
+        if (playing != null) return@produceState
+        value = withContext(Dispatchers.Default) {
+            val started = history.progressAll() // only the titles actually started, not 161 000 lookups
+            base.map { (t, url) -> (started[url] ?: 0f).let { p -> if (p == t.progress) t else t.copy(progress = p) } }
+        }
+    }
+    // Shelves ready before the household gets to Films or Séries.
+    LaunchedEffect(movieTiles) { movieTiles?.let { t -> withContext(Dispatchers.Default) { shelvesOf("gm:", t, t.filter { it.progress > 0f }) } } }
+    val showTiles by produceState<List<Tile>?>(null, cat) {
+        value = withContext(Dispatchers.Default) { cat.shows.map { Tile("s:${it.id}", it.name, it.group, it.cover, it.added, it.rating.toDoubleOrNull() ?: 0.0, it.year) } }
+    }
+    LaunchedEffect(showTiles) {
+        showTiles?.let { t ->
+            val ids = history.resume().map { it.showId }.toSet()
+            withContext(Dispatchers.Default) { shelvesOf("gs:", t, t.filter { it.key.removePrefix("s:") in ids }) }
+        }
+    }
     Box(Modifier.fillMaxSize().background(Hopla.Ground)) {
         val p = playing
         when {
@@ -223,28 +260,21 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
                 onMovie = { movie = it }, onShow = { show = it },
             )
             section == Section.LIVE -> key(liveStart) { LiveScreen(player, cat.live, prefs, history, epg, now, previewSound, liveStart, nav) }
-            section == Section.MOVIES -> {
-                val byId = remember(cat) { cat.movies.associateBy { it.id } }
-                // Building 10 000 tiles (name normalised for sorting, progress lookup) stays off the main thread.
-                val tiles by produceState<List<Tile>?>(null, cat) {
-                    value = withContext(Dispatchers.Default) { cat.movies.map { Tile("m:${it.id}", it.title, it.group, it.poster, it.added, it.rating.toDoubleOrNull() ?: 0.0, it.year, history.progress(it.url), it.tags) } }
+            section == Section.MOVIES -> movieTiles.let { list ->
+                if (list == null) Loading() else saved.SaveableStateProvider("movies") {
+                    VodHub(list, remember(list) { list.filter { it.progress > 0f } }, prefs, history, "gm:", "sortMovies", "Rechercher un film", spotOf = { t ->
+                        val info = src.movieInfo(t.key.removePrefix("m:"))
+                        Spot(info.backdrop, info.plot, info.genre, fmtDuration(info.duration))
+                    }, nav = nav) { t -> movie = moviesById[t.key.removePrefix("m:")] }
                 }
-                val list = tiles
-                if (list == null) Loading() else saved.SaveableStateProvider("movies") { VodHub(list, remember(list) { list.filter { it.progress > 0f } }, prefs, "sortMovies", "Rechercher un film", spotOf = { t ->
-                    val info = src.movieInfo(t.key.removePrefix("m:"))
-                    Spot(info.backdrop, info.plot, info.genre, fmtDuration(info.duration))
-                }, nav = nav) { t -> movie = byId[t.key.removePrefix("m:")] } }
             }
-            section == Section.SHOWS -> {
-                val byId = remember(cat) { cat.shows.associateBy { it.id } }
-                val tiles by produceState<List<Tile>?>(null, cat) {
-                    value = withContext(Dispatchers.Default) { cat.shows.map { Tile("s:${it.id}", it.title, it.group, it.cover, it.added, it.rating.toDoubleOrNull() ?: 0.0, it.year, tags = it.tags) } }
+            section == Section.SHOWS -> showTiles.let { list ->
+                val resumeIds = remember(cat, playing == null) { history.resume().map { it.showId }.toSet() }
+                if (list == null) Loading() else saved.SaveableStateProvider("shows") {
+                    VodHub(list, remember(list, resumeIds) { list.filter { it.key.removePrefix("s:") in resumeIds } }, prefs, history, "gs:", "sortShows", "Rechercher une série", spotOf = { t ->
+                        showsById[t.key.removePrefix("s:")]?.let { Spot(it.backdrop, it.plot, it.genre, "") }
+                    }, nav = nav) { t -> show = showsById[t.key.removePrefix("s:")] }
                 }
-                val resumeIds = remember(cat) { history.resume().map { it.showId }.toSet() }
-                val list = tiles
-                if (list == null) Loading() else saved.SaveableStateProvider("shows") { VodHub(list, remember(list) { list.filter { it.key.removePrefix("s:") in resumeIds } }, prefs, "sortShows", "Rechercher une série", spotOf = { t ->
-                    byId[t.key.removePrefix("s:")]?.let { Spot(it.backdrop, it.plot, it.genre, "") }
-                }, nav = nav) { t -> show = byId[t.key.removePrefix("s:")] } }
             }
         }
     }
@@ -258,11 +288,27 @@ private fun Wordmark(size: Int) {
     }
 }
 
+/**
+ * Loading screen. With [progress] (a first download, or a new playlist) the "hopla." wordmark fills with the
+ * accent colour as the lists arrive, with the percentage and what is being done; without it, the plain wordmark.
+ */
 @Composable
-private fun Loading() {
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Wordmark(42)
-        Text("Chargement des chaînes…", color = Hopla.TextDim, fontFamily = Hopla.Body, fontSize = 13.sp)
+private fun Loading(progress: Pair<Float, String>? = null) {
+    val p by androidx.compose.animation.core.animateFloatAsState(progress?.first ?: 0f, androidx.compose.animation.core.tween(600), label = "loading")
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box {
+            Row {
+                Text("hopla", color = Hopla.Chip, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 64.sp)
+                Text(".", color = Hopla.Chip, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 64.sp)
+            }
+            // The same wordmark in colour, revealed from the left as far as the download has gone.
+            Row(Modifier.drawWithContent { clipRect(right = size.width * (if (progress == null) 1f else p)) { this@drawWithContent.drawContent() } }) {
+                Text("hopla", color = Hopla.Text, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 64.sp)
+                Text(".", color = Hopla.Accent, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 64.sp)
+            }
+        }
+        if (progress != null) Text("${(p * 100).toInt()} %", color = Hopla.Accent, fontFamily = Hopla.Display, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+        Text(progress?.second ?: "Chargement…", color = Hopla.TextDim, fontFamily = Hopla.Body, fontSize = 14.sp)
     }
 }
 

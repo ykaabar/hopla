@@ -218,7 +218,7 @@ private fun Field(
     val scope = rememberCoroutineScope()
     val source = remember { MutableInteractionSource() }
     val focused by source.collectIsFocusedAsState()
-    LaunchedEffect(editing) { if (editing) edit.focusSoon() }
+    LaunchedEffect(editing) { if (editing && edit.focusSoon()) keyboard?.show() }
     fun done() { keyboard?.hide(); editing = false; scope.launch { next.focusSoon() } }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {

@@ -2,6 +2,8 @@ package com.hopla.tv
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class PlaylistTest {
@@ -242,5 +244,14 @@ class StreamingParseTest {
         assertEquals("https://github.com/o/hopla/releases/download/v0.3/hopla-42.apk", u.apk)
         assertNull(parseRelease(json, current = 42))
         assertNull(parseRelease("""{"tag_name":"v1","assets":[]}""", current = 1))
+    }
+
+    @Test fun tagsAtTheEndAndSeparators() {
+        assertEquals("Tombé du ciel", cleanTitle("Tombé du ciel - 2026 [HDTS]"))
+        assertEquals("HDTS", titleTags("Tombé du ciel - 2026 [HDTS]"))
+        assertEquals("Les Infiltrés", cleanTitle("Les Infiltrés (2006) (MULTI)"))
+        assertEquals("ecume des jours oe", searchKey(" Écume des Jours Œ "))
+        assertTrue(isSeparator("###### FORMULA 1 ######"))
+        assertFalse(isSeparator("#1 Hits"))
     }
 }

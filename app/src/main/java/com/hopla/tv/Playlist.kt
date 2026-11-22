@@ -25,15 +25,16 @@ const val USER_AGENT = "Hopla/0.2"
 data class Channel(val name: String, val group: String, val url: String, val logo: String = "", val epgId: String = "")
 data class Movie(val id: String, val name: String, val group: String, val poster: String, val url: String, val added: Long, val rating: String, val year: Int = 0) {
     /** [name] as the provider wrote it stays the stored key; screens show [title] and [tags]. */
-    val title by lazy(LazyThreadSafetyMode.PUBLICATION) { cleanTitle(name) }
-    val tags by lazy(LazyThreadSafetyMode.PUBLICATION) { titleTags(name) }
+    // Computed when shown, never stored: two lazy holders per title cost 13 MB with 161 000 films.
+    val title get() = cleanTitle(name)
+    val tags get() = titleTags(name)
 }
 data class Show(
     val id: String, val name: String, val group: String, val cover: String, val plot: String, val rating: String, val added: Long,
     val year: Int = 0, val backdrop: String = "", val genre: String = "",
 ) {
-    val title by lazy(LazyThreadSafetyMode.PUBLICATION) { cleanTitle(name) }
-    val tags by lazy(LazyThreadSafetyMode.PUBLICATION) { titleTags(name) }
+    val title get() = cleanTitle(name)
+    val tags get() = titleTags(name)
 }
 data class Episode(val id: String, val season: Int, val number: Int, val title: String, val plot: String, val image: String, val url: String)
 data class MovieInfo(
@@ -94,7 +95,7 @@ fun parseM3u(lines: Sequence<String>): List<Channel> {
             logo = LOGO.find(line)?.groupValues?.get(1).orEmpty()
             id = TVG_ID.find(line)?.groupValues?.get(1).orEmpty()
         } else if (line.isNotEmpty() && !line.startsWith("#")) {
-            out += Channel(name.ifEmpty { line }, group, line, logo, guideId(id))
+            if (!isSeparator(name)) out += Channel(name.ifEmpty { line }, group, line, logo, guideId(id))
             name = ""; group = ""; logo = ""; id = ""
         }
     }
@@ -104,6 +105,9 @@ fun parseM3u(lines: Sequence<String>): List<Channel> {
 private val GROUP = Regex("""group-title="([^"]*)"""")
 private val LOGO = Regex("""tvg-logo="([^"]*)"""")
 private val TVG_ID = Regex("""tvg-id="([^"]*)"""")
+
+/** Providers list headers such as "###### FORMULA 1 ######" as channels; they play nothing. */
+fun isSeparator(name: String) = name.trim().let { it.length > 2 && it.startsWith("#") && it.endsWith("#") }
 
 /** Guide ids are matched loosely: "6ter.fr@SD" in a playlist is "6ter.fr" in most guides. */
 fun guideId(id: String) = id.substringBefore('@').trim().lowercase()
@@ -177,7 +181,7 @@ fun parseLive(json: Reader, cats: Map<String, String>, x: Xtream, ext: String): 
     fun shared(s: String) = pool.getOrPut(s) { s }
     return mapObjects(json) {
         Channel(it.str("name"), cats[it.str("category_id")].orEmpty(), x.live(it.str("stream_id"), ext), shared(it.str("stream_icon")), shared(guideId(it.str("epg_channel_id"))))
-    }
+    }.filterNot { isSeparator(it.name) }
 }
 
 private val YEAR = Regex("""(?:19|20)\d{2}""")
@@ -248,16 +252,17 @@ fun trailerUrl(info: JSONObject?): String {
 // Release tags providers put in front of titles: "VOSTFR/HDCAM - Titre", "[FR] Titre", "|4K| Titre", "FR: Titre".
 private const val TAG = """(?:VOSTFR|VOSTA|VOST|TRUEFRENCH|FRENCH|MULTI|VFF|VFQ|VFI|VF|VO|FR|EN|ENG|HDCAM|CAM|HDTS|TS|HDRIP|WEBRIP|WEB|SD|HD|FHD|UHD|4K|HDR|3D)"""
 private val TAGS_PREFIX = Regex("""^\s*(?:[\[|(]\s*$TAG(?:\s*[/ +]\s*$TAG)*\s*[\]|)]\s*[-:|]?\s*|$TAG(?:\s*[/ +]\s*$TAG)*\s*[-:|]\s*)+""", RegexOption.IGNORE_CASE)
+private val TAGS_SUFFIX = Regex("""\s*[\[(|]\s*$TAG(?:\s*[/ +]\s*$TAG)*\s*[\])|]\s*$""", RegexOption.IGNORE_CASE)
 private val YEAR_SUFFIX = Regex("""\s*[-(\[]\s*(?:19|20)\d{2}\s*[)\]]?\s*$""")
 
 /** "VOSTFR/HDCAM - Comment braquer une banque (2026)" -> "Comment braquer une banque": the year and tags have their own place. */
 fun cleanTitle(raw: String): String {
-    val t = raw.replace(TAGS_PREFIX, "").replace(YEAR_SUFFIX, "").trim()
+    val t = raw.replace(TAGS_PREFIX, "").replace(TAGS_SUFFIX, "").replace(YEAR_SUFFIX, "").trim()
     return t.ifEmpty { raw.trim() }
 }
 
 /** The release tags removed by [cleanTitle], for the info line: "VOSTFR · HDCAM". */
-fun titleTags(raw: String): String = TAGS_PREFIX.find(raw)?.value.orEmpty()
+fun titleTags(raw: String): String = (TAGS_PREFIX.find(raw)?.value.orEmpty() + " " + TAGS_SUFFIX.find(raw)?.value.orEmpty())
     .split('[', ']', '|', '(', ')', '/', '+', '-', ':', ' ').map { it.trim().uppercase() }.filter { it.isNotEmpty() }.distinct().joinToString(" · ")
 
 private val EPISODE_PREFIX = Regex("""^.*?\bS\d{1,2}\s?E\d{1,3}\b\s*[-–:·|]*\s*""", RegexOption.IGNORE_CASE)
@@ -387,31 +392,58 @@ class Source(val link: String, root: File) {
     }
 
     private val store get() = File(dir, "catalog.bin")
+    /** How old the copy on the TV is (very old when there is none). */
+    val cacheAge get() = System.currentTimeMillis() - store.lastModified()
     val hasCache get() = store.exists() || File(dir, if (xtream == null) "playlist.m3u" else "live.json").exists()
 
-    private fun fetch(url: String, name: String, fresh: Boolean): File {
+    /** [step] hears (bytes so far, total or -1) about every 512 KB, for the loading screen. */
+    private fun fetch(url: String, name: String, fresh: Boolean, step: ((Long, Long) -> Unit)? = null): File {
         val f = File(dir, name)
         if (!fresh && f.exists()) return f
         val tmp = File(dir, "$name.tmp")
-        open(url).use { input -> tmp.outputStream().use { input.copyTo(it) } }
+        val c = connect(url)
+        val total = c.contentLengthLong
+        c.inputStream.use { input ->
+            tmp.outputStream().use { out ->
+                val buf = ByteArray(64 * 1024)
+                var done = 0L
+                var next = 0L
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    if (step != null && done >= next) { step(done, total); next = done + 512 * 1024 }
+                }
+            }
+        }
         if (!tmp.renameTo(f)) throw IOException("cache write failed")
         return f
     }
 
     private fun text(url: String, name: String, fresh: Boolean) = fetch(url, name, fresh).readText()
-    private fun reader(url: String, name: String, fresh: Boolean): Reader = fetch(url, name, fresh).bufferedReader()
+    /** A big list, downloaded between [from] and 80 % of the way to [to]; reading it takes the rest. */
+    private fun reader(url: String, name: String, fresh: Boolean, from: Float, to: Float, what: String, progress: (Float, String) -> Unit): Reader {
+        val f = fetch(url, name, fresh) { done, total ->
+            val p = if (total > 0) from + (to - from) * 0.8f * done / total else from
+            progress(p, "Téléchargement des $what…" + if (total > 0) "" else " ${done / 1_000_000} Mo")
+        }
+        progress(from + (to - from) * 0.8f, "Lecture des $what…")
+        return f.bufferedReader()
+    }
 
     /** Blocking: call off the main thread. */
-    fun catalog(fresh: Boolean): Catalog {
+    fun catalog(fresh: Boolean, progress: (Float, String) -> Unit = { _, _ -> }): Catalog {
         val secret = xtream?.secret.orEmpty()
         // The Xtream guide address carries the password as a query parameter: never stored, rebuilt from the link.
         fun Catalog.withGuide() = if (xtream != null) copy(guide = xtream.xmltv()) else this
         if (!fresh) runCatching { store.inputStream().use { readCatalog(it, secret) } }.getOrNull()?.let { return it.withGuide() }
-        val parsed = parseCatalog(fresh)
+        val parsed = parseCatalog(fresh, progress)
         // A failed films or series download must not wipe what we had: reuse the previous copy for that part.
         val previous = if (parsed.movies == null || parsed.shows == null) runCatching { store.inputStream().use { readCatalog(it, secret) } }.getOrNull() else null
         val c = Catalog(parsed.live, parsed.movies ?: previous?.movies.orEmpty(), parsed.shows ?: previous?.shows.orEmpty(), parsed.guide)
         // Keep the fast binary copy for the next start; a failed write only costs that speed-up.
+        progress(0.98f, "Préparation…")
         runCatching {
             val tmp = File(dir, "catalog.bin.tmp")
             tmp.outputStream().use { writeCatalog(if (xtream != null) c.copy(guide = "") else c, it, secret) }
@@ -423,8 +455,9 @@ class Source(val link: String, root: File) {
     /** Like [Catalog], with null for a section that failed (as opposed to one that is really empty). */
     private class Parsed(val live: List<Channel>, val movies: List<Movie>?, val shows: List<Show>?, val guide: String)
 
-    private fun parseCatalog(fresh: Boolean): Parsed {
-        val x = xtream ?: return m3uCatalog(fresh).let { Parsed(it.live, it.movies, it.shows, it.guide) }
+    private fun parseCatalog(fresh: Boolean, progress: (Float, String) -> Unit): Parsed {
+        val x = xtream ?: return m3uCatalog(fresh, progress).let { Parsed(it.live, it.movies, it.shows, it.guide) }
+        progress(0.02f, "Connexion au serveur…")
         val accountFile = fetch(x.api(), "account.json", fresh)
         val account = JSONObject(accountFile.readText())
         val info = account.optJSONObject("user_info")
@@ -434,20 +467,23 @@ class Source(val link: String, root: File) {
             File(dir, "account.json").delete()
             throw IOException("identifiants refusés par le serveur")
         }
-        val live = parseLive(reader(x.api("get_live_streams"), "live.json", fresh),
+        val live = parseLive(reader(x.api("get_live_streams"), "live.json", fresh, 0.05f, 0.30f, "chaînes", progress),
             parseCategories(text(x.api("get_live_categories"), "live_cats.json", fresh)), x, liveExtension(info))
         // Films and series are a bonus: a server that fails them must not block live TV.
         val movies = runCatching {
-            parseMovies(reader(x.api("get_vod_streams"), "vod.json", fresh), parseCategories(text(x.api("get_vod_categories"), "vod_cats.json", fresh)), x)
+            parseMovies(reader(x.api("get_vod_streams"), "vod.json", fresh, 0.30f, 0.70f, "films", progress), parseCategories(text(x.api("get_vod_categories"), "vod_cats.json", fresh)), x)
         }.getOrNull()
         val shows = runCatching {
-            parseShows(reader(x.api("get_series"), "series.json", fresh), parseCategories(text(x.api("get_series_categories"), "series_cats.json", fresh)))
+            parseShows(reader(x.api("get_series"), "series.json", fresh, 0.70f, 0.97f, "séries", progress), parseCategories(text(x.api("get_series_categories"), "series_cats.json", fresh)))
         }.getOrNull()
         return Parsed(live, movies, shows, x.xmltv())
     }
 
-    private fun m3uCatalog(fresh: Boolean): Catalog {
-        val f = fetch(link.trim(), "playlist.m3u", fresh)
+    private fun m3uCatalog(fresh: Boolean, progress: (Float, String) -> Unit = { _, _ -> }): Catalog {
+        val f = fetch(link.trim(), "playlist.m3u", fresh) { done, total ->
+            progress(if (total > 0) 0.9f * done / total else 0.05f, "Téléchargement de la playlist…" + if (total > 0) "" else " ${done / 1_000_000} Mo")
+        }
+        progress(0.92f, "Lecture de la playlist…")
         val header = f.bufferedReader().use { r -> generateSequence { r.readLine() }.firstOrNull { it.isNotBlank() } }.orEmpty().trimStart('\uFEFF').trim()
         // An expired domain or a login page answers with HTML; don't turn that into fake "channels".
         if (!header.startsWith("#EXTM3U") && !header.startsWith("#EXTINF")) {
@@ -457,11 +493,11 @@ class Source(val link: String, root: File) {
         return Catalog(f.bufferedReader().useLines { parseM3u(it) }, guide = m3uGuideUrl(header))
     }
 
-    /** Guide from cache, refreshed when older than 12 h; a failed refresh keeps the old copy. */
+    /** Guide from cache, refreshed once a day (providers publish it daily); a failed refresh keeps the old copy. */
     fun guide(url: String, wanted: Set<String>, now: Long): Epg {
         if (url.isBlank()) return Epg.EMPTY
         val f = File(dir, "epg.xml")
-        if (!f.exists() || now - f.lastModified() > 12 * 3_600_000L) runCatching { fetch(url, "epg.xml", true) }
+        if (!f.exists() || now - f.lastModified() > 24 * 3_600_000L) runCatching { fetch(url, "epg.xml", true) }
         if (!f.exists()) return Epg.EMPTY
         return BufferedInputStream(f.inputStream()).use { raw ->
             raw.mark(2)
@@ -485,7 +521,10 @@ class Source(val link: String, root: File) {
     fun showInfo(id: String): ShowInfo = parseShowInfo(info(xtream!!.api("get_series_info", "&series_id=$id"), "series_$id.json"), xtream)
 }
 
-fun open(url: String): InputStream {
+fun open(url: String): InputStream = connect(url).inputStream
+
+/** An answered connection (HTTP 200), redirects followed. */
+fun connect(url: String): HttpURLConnection {
     var u = URL(url)
     // Follow redirects ourselves: HttpURLConnection refuses http <-> https hops, which providers use a lot (HTTP 301/302).
     repeat(6) {
@@ -503,7 +542,7 @@ fun open(url: String): InputStream {
         }
         // Message never contains the URL, so the password can't leak into the UI.
         if (code != 200) { c.disconnect(); throw IOException("le serveur a répondu HTTP $code") }
-        return c.inputStream
+        return c
     }
     throw IOException("trop de redirections")
 }

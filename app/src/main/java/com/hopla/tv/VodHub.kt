@@ -64,11 +64,10 @@ import kotlinx.coroutines.withContext
 /** One film or series as the catalogue screens see it. [key] is "m:<id>" or "s:<id>". */
 data class Tile(
     val key: String, val name: String, val group: String, val poster: String,
-    val added: Long, val rating: Double, val year: Int, val progress: Float = 0f, val tags: String = "",
-) {
-    /** Accent- and case-free name, computed once: sorting 10 000 titles must not normalise on every comparison. */
-    val sortName: String = searchKey(name)
-}
+    val added: Long, val rating: Double, val year: Int, val progress: Float = 0f,
+)
+// [Tile.name] is the provider's raw name: cleaning it for 161 000 films up front took 82 s on a Fire TV, so the
+// title, tags and sort key are worked out only for what is shown, sorted or searched.
 
 /** What the spotlight shows on top of the tile itself; fetched lazily for the focused title. */
 data class Spot(val backdrop: String, val plot: String, val genre: String, val duration: String)
@@ -77,10 +76,10 @@ enum class Sort(val label: String) { ADDED("Ajout récent"), NAME("Nom"), YEAR("
 
 fun sortTiles(list: List<Tile>, sort: Sort): List<Tile> = when (sort) {
     Sort.ADDED -> list.sortedByDescending { it.added }
-    Sort.NAME -> list.sortedBy { it.sortName }
+    Sort.NAME -> list.map { searchKey(cleanTitle(it.name)) to it }.sortedBy { it.first }.map { it.second }
     // Unknown years and ratings go last, not first.
-    Sort.YEAR -> list.sortedWith(compareByDescending<Tile> { it.year }.thenBy { it.sortName })
-    Sort.RATING -> list.sortedWith(compareByDescending<Tile> { it.rating }.thenBy { it.sortName })
+    Sort.YEAR -> list.sortedWith(compareByDescending<Tile> { it.year }.thenBy { it.name })
+    Sort.RATING -> list.sortedWith(compareByDescending<Tile> { it.rating }.thenBy { it.name })
 }
 
 /** Only offer the sorts the provider's data can support. */
@@ -109,7 +108,18 @@ fun ratingLabel(r: Double) = if (r > 0) "%.1f".format(r).replace('.', ',') else 
 private const val FEATURED = "À la une"
 
 /** Everything heavy about the screen, built off the main thread (10 000 titles froze the UI before). */
-private class Shelves(val list: List<Pair<String, List<Tile>>>)
+class Shelves(val list: List<Pair<String, List<Tile>>>)
+
+private val shelfMemo = HashMap<String, Triple<List<Tile>, List<Tile>, Shelves>>()
+
+/**
+ * The "À la une" shelves of one section ([kind]), worked out once per list and kept: sorting 161 000 films
+ * took seconds on every visit. MainActivity warms it in the background as soon as the tiles exist.
+ */
+fun shelvesOf(kind: String, tiles: List<Tile>, resume: List<Tile>): Shelves {
+    synchronized(shelfMemo) { shelfMemo[kind]?.takeIf { it.first === tiles && it.second == resume }?.let { return it.third } }
+    return buildShelves(tiles, resume, Sort.ADDED).also { synchronized(shelfMemo) { shelfMemo[kind] = Triple(tiles, resume, it) } }
+}
 
 private fun buildShelves(tiles: List<Tile>, resume: List<Tile>, sort: Sort) = Shelves(buildList {
     if (resume.isNotEmpty()) add("Reprendre" to resume)
@@ -125,22 +135,37 @@ private fun buildShelves(tiles: List<Tile>, resume: List<Tile>, sort: Sort) = Sh
  */
 @Composable
 fun VodHub(
-    tiles: List<Tile>, resume: List<Tile>, prefs: SharedPreferences, sortKey: String, searchHint: String,
+    tiles: List<Tile>, resume: List<Tile>, prefs: SharedPreferences, history: History, pinPrefix: String, sortKey: String, searchHint: String,
     spotOf: suspend (Tile) -> Spot?, nav: Nav, onOpen: (Tile) -> Unit,
 ) {
-    val groups = remember(tiles) { listOf(FEATURED) + tiles.mapTo(LinkedHashSet()) { it.group }.filter { it.isNotBlank() } }
+    // Pinned categories ("gm:<name>" for films, "gs:<name>" for series) come right after "À la une".
+    var pinned by remember { mutableStateOf(history.favorites().filter { it.startsWith(pinPrefix) }.map { it.removePrefix(pinPrefix) }.toSet()) }
+    val groups = remember(tiles, pinned) {
+        val all = tiles.mapTo(LinkedHashSet()) { it.group }.filter { it.isNotBlank() }
+        listOf(FEATURED) + all.filter { it in pinned } + all.filterNot { it in pinned }
+    }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    fun pin(g: String) {
+        if (g == FEATURED) return
+        val added = history.toggleFavorite(pinPrefix + g)
+        pinned = if (added) pinned + g else pinned - g
+        android.widget.Toast.makeText(context, if (added) "${groupLabel(g)} épinglée en haut" else "${groupLabel(g)} n'est plus épinglée", android.widget.Toast.LENGTH_SHORT).show()
+    }
     var group by rememberSaveable { mutableStateOf(FEATURED) }
     val sorts = remember(tiles) { availableSorts(tiles) }
     var sort by remember { mutableStateOf(Sort.entries.firstOrNull { it.name == prefs.getString(sortKey, null) }?.takeIf { it in sorts } ?: Sort.ADDED) }
     var query by rememberSaveable { mutableStateOf("") }
     val searching = isSearching(query)
-    val keyed = remember(tiles) { tiles.map { it to it.sortName } }
+    // Search keys for every title, built in the background the first time the household searches.
+    val keyed by produceState<List<Pair<Tile, String>>?>(null, tiles, searching) {
+        if (searching && value == null) value = withContext(Dispatchers.Default) { tiles.map { it to searchKey(it.name) } }
+    }
     // The curated shelves keep their own order: a name sort made "À la une" start with "24 Hours…".
-    val shelves by produceState<Shelves?>(null, tiles, resume) { value = withContext(Dispatchers.Default) { buildShelves(tiles, resume, Sort.ADDED) } }
+    val shelves by produceState<Shelves?>(null, tiles, resume) { value = withContext(Dispatchers.Default) { shelvesOf(pinPrefix, tiles, resume) } }
     // One category (or the search results) at a time; categories change as the menu focus moves, so wait a beat.
-    val grid by produceState<List<Tile>?>(null, tiles, group, sort, query) {
+    val grid by produceState<List<Tile>?>(null, tiles, group, sort, query, keyed) {
         value = null
-        if (isSearching(query)) { delay(200); value = withContext(Dispatchers.Default) { sortTiles(searchIn(keyed, query, limit = 500), sort) } }
+        if (isSearching(query)) { val k = keyed ?: return@produceState; delay(200); value = withContext(Dispatchers.Default) { sortTiles(searchIn(k, query, limit = 500), sort) } }
         else if (group != FEATURED) { delay(250); value = withContext(Dispatchers.Default) { sortTiles(tiles.filter { it.group == group }, sort) } }
     }
     val showShelves = !searching && group == FEATURED
@@ -170,10 +195,14 @@ fun VodHub(
     val content = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
     val ready = if (showShelves) shelves != null else grid != null
+    // Only the first arrival places the focus. Categories change as the menu focus moves over them; taking the
+    // focus back to the posters each time made the menu impossible to browse.
+    var landed by remember { mutableStateOf(false) }
     LaunchedEffect(ready) {
-        if (!ready) return@LaunchedEffect
+        if (!ready || landed) return@LaunchedEffect
         if (!(restoring && restore.focusSoon())) content.focusSoon()
         restoring = false
+        landed = true
     }
     // Back in the shelves or grid opens the menu (categories, search); Back there returns here.
     val toMenu = Modifier.onPreviewKeyEvent {
@@ -185,7 +214,8 @@ fun VodHub(
     Box(Modifier.fillMaxSize()) {
         FullBackdrop(backdrop)
         Row(Modifier.fillMaxSize().padding(18.dp)) {
-            SideMenu(nav, query, { query = it }, searchHint, groups, group, { group = it }, menu, toContent = { scope.launch { content.focusSoon() } })
+            SideMenu(nav, query, { query = it }, searchHint, groups, group, { group = it }, menu, toContent = { scope.launch { content.focusSoon() } },
+                pinned = pinned, onPin = ::pin)
             Spacer(Modifier.width(26.dp))
             Column(Modifier.weight(1f).fillMaxHeight()) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -221,7 +251,7 @@ fun VodHub(
 private fun Spotlight(t: Tile?, spot: Spot?) {
     Column(Modifier.width(640.dp), verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom)) {
         if (t == null) return@Column
-        Text(t.name, color = Color.White, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 42.sp, lineHeight = 43.sp,
+        Text(cleanTitle(t.name), color = Color.White, fontFamily = Hopla.Display, fontWeight = FontWeight.ExtraBold, fontSize = 42.sp, lineHeight = 43.sp,
             maxLines = 2, overflow = TextOverflow.Ellipsis)
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (t.rating > 0) {
@@ -230,7 +260,7 @@ private fun Spotlight(t: Tile?, spot: Spot?) {
                 Text(ratingLabel(t.rating), color = Hopla.Accent, fontFamily = Hopla.Body, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 Spacer(Modifier.width(10.dp))
             }
-            val meta = listOfNotNull(t.year.takeIf { it > 0 }?.toString(), spot?.genre?.ifBlank { null }, spot?.duration?.ifBlank { null }, t.tags.ifBlank { null })
+            val meta = listOfNotNull(t.year.takeIf { it > 0 }?.toString(), spot?.genre?.ifBlank { null }, spot?.duration?.ifBlank { null }, titleTags(t.name).ifBlank { null })
             Text(meta.joinToString("  ·  "), color = Color.White, fontFamily = Hopla.Body, fontWeight = FontWeight.Bold, fontSize = 14.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }

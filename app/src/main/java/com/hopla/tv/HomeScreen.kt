@@ -69,7 +69,7 @@ fun HomeScreen(
 ) {
     val byUrl = remember(catalog) { catalog.live.associateBy { it.url } }
     val recent = remember(catalog) { history.recentChannels().mapNotNull { byUrl[it] } }
-    val hero = recent.firstOrNull() ?: catalog.live.first()
+    val hero = recent.firstOrNull { !isSeparator(it.name) } ?: catalog.live.firstOrNull { !isSeparator(it.name) } ?: catalog.live.first()
     val channels = recent.ifEmpty { catalog.live.take(12) }
     val favorites = remember(catalog) { history.favorites() }
     val favChannels = remember(catalog) { favorites.filter { it.startsWith("c:") }.mapNotNull { byUrl[it.removePrefix("c:")] } }

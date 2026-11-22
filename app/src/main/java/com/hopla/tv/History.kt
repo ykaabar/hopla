@@ -38,6 +38,12 @@ class History(private val prefs: SharedPreferences) {
 
     fun position(url: String) = prefs.getLong("pos:${mask(url)}", 0)
 
+    /** Every started title: real (unmasked) url -> progress. */
+    fun progressAll(): Map<String, Float> = prefs.all.keys.filter { it.startsWith("dur:") }.associate { k ->
+        val url = unmask(k.removePrefix("dur:"))
+        url to progress(url)
+    }
+
     fun progress(url: String): Float {
         val dur = prefs.getLong("dur:${mask(url)}", 0)
         return if (dur > 0) (position(url).toFloat() / dur).coerceIn(0f, 1f) else 0f
