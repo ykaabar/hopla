@@ -39,7 +39,13 @@ jobs:
           chmod +x gradlew
           ./gradlew testDebugUnitTest assembleRelease -PversionCode="$VERSION_CODE" -PversionName="$VERSION_NAME"
           cp app/build/outputs/apk/release/app-release.apk "hopla-$VERSION_CODE.apk"
+          # Same APK under a fixed name, for a first install with Downloader on a Fire TV:
+          # https://github.com/ykaabar/hopla/releases/latest/download/hopla.apk always points at the latest one.
+          # The in-app updater only looks at hopla-<versionCode>.apk, so this copy does not disturb it.
+          cp app/build/outputs/apk/release/app-release.apk hopla.apk
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: hopla-*.apk
+          files: |
+            hopla-*.apk
+            hopla.apk
