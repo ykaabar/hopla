@@ -62,6 +62,8 @@ import kotlinx.coroutines.launch
 /** Where the household can go from the "hopla." button. */
 class Nav(
     val current: Section, val sections: List<Section>, val go: (Section) -> Unit, val settings: () -> Unit, val refresh: () -> Unit = {},
+    /** Opens the category manager (hide categories, parental code). */
+    val categories: () -> Unit = {},
     /** Label and action of "Mettre à jour Hopla" when a newer version is published, else null. */
     val update: Pair<String, () -> Unit>? = null,
 )
@@ -177,7 +179,8 @@ fun SideMenu(
             if (switcher) {
                 Spacer(Modifier.height(4.dp))
                 val rows = nav.sections.map { Triple(it.label, it.icon) { nav.go(it) } } +
-                    Triple("Rafraîchir la playlist", Icons.Restart, nav.refresh) + Triple("Paramètres", Icons.Settings, nav.settings) +
+                    Triple("Rafraîchir la playlist", Icons.Restart, nav.refresh) + Triple("Catégories masquées", Icons.Lock, nav.categories) +
+                    Triple("Paramètres", Icons.Settings, nav.settings) +
                     listOfNotNull(nav.update?.let { (label, go) -> Triple(label, Icons.Plus, go) })
                 rows.forEachIndexed { i, (label, icon, go) ->
                     val active = nav.sections.getOrNull(i) == nav.current

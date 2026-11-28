@@ -103,6 +103,9 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
     var progress by remember { mutableStateOf<Pair<Float, String>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var settings by remember { mutableStateOf(false) }
+    // Hidden categories (adult ones by default) and the manager that changes them, behind the parental code.
+    var filter by remember { mutableStateOf(GroupFilter.load(prefs)) }
+    var managing by remember { mutableStateOf(false) }
     var section by remember { mutableStateOf(Section.HOME) }
     var liveStart by remember { mutableStateOf<Channel?>(null) }
     var movie by remember { mutableStateOf<Movie?>(null) }
@@ -175,7 +178,9 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
         update?.let { Toast.makeText(context, "Nouvelle version de Hopla (${it.name}) : menu hopla. › Mettre à jour", Toast.LENGTH_LONG).show() }
     }
 
-    val cat = catalog
+    val full = catalog
+    // Every screen below gets the catalogue without its hidden categories.
+    val cat = remember(full, filter) { full?.visible(filter) }
     val src = source
     if (cat == null || src == null || settings) {
         // From the settings, Back returns to the channels instead of quitting the app.
@@ -183,6 +188,10 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
         Box(Modifier.fillMaxSize().background(Hopla.Ground)) {
             if (loading) Loading(progress) else SetupScreen(link, { link = it }, error, previewSound, { previewSound = it; prefs.edit().putString("previewSound", it.name).apply() }) { catalog = null; load(userAction = true) }
         }
+        return
+    }
+    if (managing && full != null) {
+        CategoriesScreen(full, prefs, filter) { filter = it; managing = false }
         return
     }
 
@@ -196,6 +205,7 @@ fun App(player: ExoPlayer, prefs: SharedPreferences) {
         epg = withContext(Dispatchers.IO) { runCatching { src.guide(cat.guide, wanted, System.currentTimeMillis()) }.onFailure { android.util.Log.w("Hopla", "guide", it) }.getOrDefault(Epg.EMPTY) }
     }
     val nav = Nav(section, sections, go = { liveStart = null; section = it }, settings = { player.stop(); settings = true }, refresh = { load(userAction = false, refresh = true) },
+        categories = { player.stop(); managing = true },
         update = update?.let { u ->
             "Mettre à jour Hopla (${u.name})" to {
                 Toast.makeText(context, "Téléchargement de la mise à jour…", Toast.LENGTH_SHORT).show()

@@ -121,5 +121,6 @@ object Icons {
     val Restart = strokeIcon("M4 12a8 8 0 1 0 2.3-5.6", "M4 4v4h4")
     val Trailer = strokeIcon("M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z", "M10 9v6l5-3z")
     val List = strokeIcon("M8 6h12M8 12h12M8 18h12", "M4 6h.5M4 12h.5M4 18h.5")
+    val Lock = strokeIcon("M6 11h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z", "M8 11V8a4 4 0 0 1 8 0v3")
     val Lang = strokeIcon("M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z", "M7 11h4M7 14h8")
 }

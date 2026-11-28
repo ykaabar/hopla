@@ -80,7 +80,8 @@ fun HomeScreen(
         favorites.mapNotNull { k -> if (k.startsWith("m:")) moviesById[k.removePrefix("m:")] else if (k.startsWith("s:")) showsById[k.removePrefix("s:")] else null }
     }
     val heroProg = epg.now(hero, now)
-    val resume = remember(catalog) { history.resume() }
+    // "Reprendre" keeps its own copy of each title: one from a hidden category must not show up here.
+    val resume = remember(catalog) { history.resume().filter { it.url !in catalog.hidden && "s:${it.showId}" !in catalog.hidden } }
     // Sorting 10 000 films in the middle of drawing dropped frames: done off the main thread.
     val movies by produceState(emptyList<Movie>(), catalog) { value = withContext(Dispatchers.Default) { catalog.movies.sortedByDescending { it.added }.take(15) } }
     val shows by produceState(emptyList<Show>(), catalog) { value = withContext(Dispatchers.Default) { catalog.shows.sortedByDescending { it.added }.take(15) } }

@@ -48,6 +48,8 @@ data class Catalog(
     val live: List<Channel>, val movies: List<Movie> = emptyList(), val shows: List<Show> = emptyList(),
     /** XMLTV guide address: the panel's xmltv.php, or the playlist's url-tvg header. */
     val guide: String = "",
+    /** What the parental filter took out ([visible]): channel and film addresses, "s:" + series id. Never stored. */
+    val hidden: Set<String> = emptySet(),
 )
 
 /** An Xtream Codes account: server address plus credentials (public player_api.php protocol). */
