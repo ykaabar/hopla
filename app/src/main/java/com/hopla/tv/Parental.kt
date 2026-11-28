@@ -13,7 +13,7 @@ enum class Kind(val prefix: String, val label: String) { LIVE("l:", "Direct"), M
  * (behind the parental code) shows it again.
  */
 private val ADULT = Regex(
-    """(?i)(adult|xxx|porn|erot|érot|hentai|playboy|brazzers|hustler|penthouse|\bsex|\b18\s*\+|\+\s*18\b|\(18\)|\[18])""",
+    """(?iu)(adult|xxx|porn|erot|érot|hentai|playboy|brazzers|hustler|penthouse|\bsex|\b18\s*\+|\+\s*18\b|\(18\)|\[18])""",
 )
 
 fun isAdult(group: String) = ADULT.containsMatchIn(group)
